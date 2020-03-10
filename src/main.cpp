@@ -1,135 +1,188 @@
+#include <TFT_eSPI.h>
+#include <SPI.h>
 #include <WiFi.h>
 #include <Wire.h>
-#include <SPI.h>
+#include <Button2.h>
+#include "esp_adc_cal.h"
+#include "bmp.h"
+#include <Arduino.h>
+#include <analogWrite.h>
+int brightness[6] = {0};
 
-#define POSITION 0
-#define VELOCITY 1
-#define DISPLACEMENT 2
-#define DIRECT_PWM 3
-#define maxPWM 500
+#ifndef TFT_DISPOFF
+#define TFT_DISPOFF 0x28
+#endif
 
-static const int spiClk = 1000000; // 1 MHz
+#ifndef TFT_SLPIN
+#define TFT_SLPIN   0x10
+#endif
 
-const int ss_n = 9;
+#define TFT_MOSI            19
+#define TFT_SCLK            18
+#define TFT_CS              5
+#define TFT_DC              16
+#define TFT_RST             23
 
-float Kp = 0.1, Kd = 0.01, err = 0, err_prev = 0, myo_setpoint = 0, result = 0;
-int control_mode = POSITION;
+#define TFT_BL          4  // Display backlight control pin
+#define ADC_EN          14
+#define ADC_PIN         34
+#define BUTTON_1        35
+#define BUTTON_2        0
+#define GATE0 12
+#define GATE1 13
+#define GATE2 15
+#define GATE3 2
+#define GATE4 17
+#define GATE5 22
 
-int32_t position = 0;
-int16_t velocity = 0, current = 0, pwmRef = 0;
+TFT_eSPI tft = TFT_eSPI(135, 240); // Invoke custom library
+Button2 btn1(BUTTON_1);
+Button2 btn2(BUTTON_2);
 
-const char* ssid = "roboy";
-const char* password = "wiihackroboy";
+char buff[512];
+int vref = 1100;
+int btnCick = false;
 
-IPAddress server(192, 168, 0, 120);
-IPAddress ip_address;
-int status = WL_IDLE_STATUS;
-
-void myobrickLoop() {
-
-  SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE1));
-  uint16_t data[2];
-  for(int i=0;i<12;i++){
-    digitalWrite(ss_n,LOW);
-    delayMicroseconds(1);
-    if(i==0)
-      SPI.transfer16(0x8000); // header
-    else if(i==1)
-      SPI.transfer16((pwmRef& 0x7fff));
-    else{
-      switch(i){
-        case 4:
-          data[0] = SPI.transfer16(0);
-          break;
-        case 5:
-          data[1] = SPI.transfer16(0);
-          position =  ((data[0]>>8)<<24|(data[0]&0xff)<<16|(data[1]>>8)<<8|(data[1]&0xff));
-          break;
-        case 6:
-          velocity = SPI.transfer16(0);
-          break;
-        case 7:
-          current = SPI.transfer16(0);
-          break;
-        default:
-          SPI.transfer16(0);
-         break;
-       }
-    }
-    digitalWrite(ss_n,HIGH);
-  }
-  SPI.endTransaction();
-
-  // controller
-  switch(control_mode){
-    case POSITION:
-      err = myo_setpoint-position;
-      break;
-    case VELOCITY:
-      err = myo_setpoint-velocity;
-      break;
-    case DISPLACEMENT: // not implemented
-      err = 0;
-      break;
-    case DIRECT_PWM:
-      result = myo_setpoint;
-      break;
-  }
-  if(control_mode!=DIRECT_PWM){
-    result = Kp*err + Kd*(err_prev-err);
-    err_prev = err;
-  }
-  if(result > maxPWM){
-    result = maxPWM;
-  }
-  if(result < -maxPWM){
-    result = -maxPWM;
-  }
-  pwmRef = result;
-}
-
-void setupWiFi()
+//! Long time delay, it is recommended to use shallow sleep, which can effectively reduce the current consumption
+void espDelay(int ms)
 {
-  WiFi.begin(ssid, password);
-
-  Serial.print("\nConnecting to "); Serial.println(ssid);
-  uint8_t i = 0;
-  while (WiFi.status() != WL_CONNECTED && i++ < 20) delay(500);
-  if(i == 21){
-    Serial.print("Could not connect to"); Serial.println(ssid);
-    while(1) delay(500);
-  }
-  Serial.print("Ready! Use ");
-  Serial.print(WiFi.localIP());
-  Serial.println(" to access client");
+    esp_sleep_enable_timer_wakeup(ms * 1000);
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH,ESP_PD_OPTION_ON);
+    esp_light_sleep_start();
 }
 
-void setup() {
-  Wire.begin();
-  Wire.setClock(400000);
-  Serial.begin(115200);
-  setupWiFi();
-  delay(2000);
-
-  // myobrick
-  SPI.begin();
-
-  pinMode (ss_n, OUTPUT);
-  digitalWrite(ss_n,HIGH);
+void showVoltage()
+{
+    static uint64_t timeStamp = 0;
+    if (millis() - timeStamp > 1000) {
+        timeStamp = millis();
+        uint16_t v = analogRead(ADC_PIN);
+        float battery_voltage = ((float)v / 4095.0) * 2.0 * 3.3 * (vref / 1000.0);
+        String voltage = "Voltage :" + String(battery_voltage) + "V";
+        Serial.println(voltage);
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString(voltage,  tft.width() / 2, tft.height() / 2 );
+    }
 }
 
-int i = 0;
+void button_init()
+{
+    btn1.setLongClickHandler([](Button2 & b) {
+      brightness[0]=0;
+      int32_t color = (brightness[0]<<16|brightness[0]<<8|brightness[0]);
+      tft.fillScreen(color);
+      analogWrite(GATE0, brightness[0]);
+      analogWrite(GATE1, brightness[0]);
+      analogWrite(GATE2, brightness[0]);
+      analogWrite(GATE3, brightness[0]);
+      analogWrite(GATE4, brightness[0]);
+      analogWrite(GATE5, brightness[0]);
+    });
 
-void loop() {
-  myobrickLoop();
-  if((i++%1000)==0){
-    Serial.print("\tpwm:\t");
-    Serial.print(pwmRef);
-    Serial.print("\tpos:\t");
-    Serial.print(position);
-    Serial.print("\tvel:\t");
-    Serial.print(velocity);
-    Serial.print("\tcur:\t");
-    Serial.println(current);
-  }
+    btn1.setPressedHandler([](Button2 & b) {
+
+      brightness[0]-=10;
+      if(brightness[0]<=0){
+        brightness[0] = 0;
+      }
+      int32_t color = (brightness[0]<<16|brightness[0]<<8|brightness[0]);
+      tft.fillScreen(color);
+      analogWrite(GATE0, brightness[0]);
+      analogWrite(GATE1, brightness[0]);
+      analogWrite(GATE2, brightness[0]);
+      analogWrite(GATE3, brightness[0]);
+      analogWrite(GATE4, brightness[0]);
+      analogWrite(GATE5, brightness[0]);
+    });
+
+    btn2.setLongClickHandler([](Button2 & b) {
+      brightness[0]=255;
+      int32_t color = (brightness[0]<<16|brightness[0]<<8|brightness[0]);
+      tft.fillScreen(color);
+      analogWrite(GATE0, brightness[0]);
+      analogWrite(GATE1, brightness[0]);
+      analogWrite(GATE2, brightness[0]);
+      analogWrite(GATE3, brightness[0]);
+      analogWrite(GATE4, brightness[0]);
+      analogWrite(GATE5, brightness[0]);
+    });
+
+    btn2.setPressedHandler([](Button2 & b) {
+      brightness[0]+=10;
+      if(brightness[0]>=255){
+        brightness[0] = 255;
+      }
+      int32_t color = (brightness[0]<<16|brightness[0]<<8|brightness[0]);
+      tft.fillScreen(color);
+      analogWrite(GATE0, brightness[0]);
+      analogWrite(GATE1, brightness[0]);
+      analogWrite(GATE2, brightness[0]);
+      analogWrite(GATE3, brightness[0]);
+      analogWrite(GATE4, brightness[0]);
+      analogWrite(GATE5, brightness[0]);
+    });
+}
+
+void button_loop()
+{
+    btn1.loop();
+    btn2.loop();
+}
+
+void setup()
+{
+    Serial.begin(115200);
+    Serial.println("Start");
+    tft.init();
+    tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_WHITE);
+    tft.setCursor(0, 0);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(1);
+
+    if (TFT_BL > 0) { // TFT_BL has been set in the TFT_eSPI library in the User Setup file TTGO_T_Display.h
+         pinMode(TFT_BL, OUTPUT); // Set backlight pin to output mode
+         digitalWrite(TFT_BL, TFT_BACKLIGHT_ON); // Turn backlight on. TFT_BACKLIGHT_ON has been set in the TFT_eSPI library in the User Setup file TTGO_T_Display.h
+    }
+
+    tft.setSwapBytes(true);
+    tft.pushImage(0, 0,  240, 135, ttgo);
+    espDelay(1000);
+
+    button_init();
+    pinMode(GATE0, OUTPUT);
+    pinMode(GATE1, OUTPUT);
+    pinMode(GATE2, OUTPUT);
+    pinMode(GATE3, OUTPUT);
+    pinMode(GATE4, OUTPUT);
+    pinMode(GATE5, OUTPUT);
+
+    analogWrite(GATE0,0);
+    analogWrite(GATE1,0);
+    analogWrite(GATE2,0);
+    analogWrite(GATE3,0);
+    analogWrite(GATE4,0);
+    analogWrite(GATE5,0);
+
+    esp_adc_cal_characteristics_t adc_chars;
+    esp_adc_cal_value_t val_type = esp_adc_cal_characterize((adc_unit_t)ADC_UNIT_1, (adc_atten_t)ADC1_CHANNEL_6, (adc_bits_width_t)ADC_WIDTH_BIT_12, 1100, &adc_chars);
+    //Check type of calibration value used to characterize ADC
+    if (val_type == ESP_ADC_CAL_VAL_EFUSE_VREF) {
+        Serial.printf("eFuse Vref:%u mV", adc_chars.vref);
+        vref = adc_chars.vref;
+    } else if (val_type == ESP_ADC_CAL_VAL_EFUSE_TP) {
+        Serial.printf("Two Point --> coeff_a:%umV coeff_b:%umV\n", adc_chars.coeff_a, adc_chars.coeff_b);
+    } else {
+        Serial.println("Default Vref: 1100mV");
+    }
+}
+
+
+
+void loop()
+{
+    button_loop();
 }
